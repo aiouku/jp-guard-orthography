@@ -1,0 +1,8 @@
+condition,n_rows,n_rows_with_issue,success_rate,mean_n_content,mean_n_target,mean_n_changed,word_change_rate,issue:unchanged_text,issue:n_changed_zero
+original,200,0,1.0,15.185,0.0,0.0,,0,0
+hira100,200,0,1.0,15.185,16.645,12.82,0.7702012616401321,0,0
+romaji100,200,0,1.0,15.185,16.645,16.645,1.0,0,0
+transposition,200,0,1.0,15.185,1.62,1.62,1.0,0,0
+replacement,200,0,1.0,15.185,1.62,1.62,1.0,0,0
+homophone,200,32,0.84,15.185,1.38,1.38,1.0,32,32
+split,200,0,1.0,15.185,1.62,1.62,1.0,0,0

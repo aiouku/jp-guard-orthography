@@ -1,6 +1,14 @@
-# 有害なプロンプトを含むデータ・判定結果は絶対にコミット・公開しない
+# 変換データ（data/）は build_dataset.py で再生成できるのでコミットしない
 data/
-outputs/
+
+# outputs/ はプロンプト本文を含まない集計結果だけコミットする（サーバーの結果を pull で受け取るため）
+#   コミットしない：predictions_*.csv（本文と判定）、validation_issues・manual_check（本文）、ログ
+outputs/*
+!outputs/summary_*.csv
+!outputs/per_class_*.csv
+!outputs/fnr_fpr_*.png
+!outputs/predictions_*.meta.json
+!outputs/validation_summary_*.csv
 
 .venv/
 __pycache__/
