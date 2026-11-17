@@ -1,0 +1,9 @@
+# 有害なプロンプトを含むデータ・判定結果は絶対にコミット・公開しない
+data/
+outputs/
+
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store

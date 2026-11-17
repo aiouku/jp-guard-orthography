@@ -1,0 +1,16 @@
+# Python 3.11–3.13 を想定（Apple Silicon / macOS）
+torch>=2.5
+transformers>=4.51
+datasets>=3.0
+huggingface_hub>=0.24
+pandas>=2.2
+numpy>=1.26
+sudachipy>=0.6.8
+sudachidict_core>=20240409
+pykakasi>=2.3
+statsmodels>=0.14
+scipy>=1.11
+matplotlib>=3.8
+requests>=2.31
+tqdm>=4.66
+pytest>=8.0
