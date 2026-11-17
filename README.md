@@ -1,7 +1,7 @@
 # 日本語ガードレールの表記揺れ頑健性：予備実験
 
 WildGuardTestJP のプロンプトに日本語の表記揺れ・誤字（v4 は14条件）を加え、
-**Qwen3Guard-Gen**（0.6B / 4B / 8B）のプロンプト判定（見逃し＝FNR・誤検出＝FPR）がどう変わるかを調べる。
+ガードモデル（Qwen3Guard-Gen 0.6B / 4B / 8B ほか、系統の異なる5種類）のプロンプト判定（見逃し＝FNR・誤検出＝FPR）がどう変わるかを調べる。
 主題は表記揺れ（同じ語・同じ読みで文字種だけが違う）。誤字系の条件も同じ系列の条件として並べて扱う（グループを分けた集計はしない）。
 **変換と判定は完全に分離**しており、変換済みデータセットを先に作り、確認してから判定に回す。
 
@@ -14,6 +14,7 @@ WildGuardTestJP のプロンプトに日本語の表記揺れ・誤字（v4 は1
 build_dataset.py      1. データ抽出（903件）＋ 14条件の変換 → data/
 validate_dataset.py   2. 変換の自動チェック ＋ 目視確認用 CSV の出力・集計
 run_guard.py          3. ガードモデルによる判定（--model で切り替え、再開可能、--limit で試運転）
+guards.py             モデルごとの入力の作り方・出力の読み取り方
 analyze.py            4. FNR/FPR・Wilson CI・McNemar 検定・Controversial の割合・トークン数・グラフ
 perturb/              変換ロジック（kana.py, morph.py, homophone.py, conditions.py）
 common.py             パス・seed など共通設定
@@ -103,10 +104,27 @@ python validate_dataset.py
 ### 3. 判定（全件）
 
 ```bash
-python run_guard.py                                                       # 0.6B（float32）
-python run_guard.py --model Qwen/Qwen3Guard-Gen-4B --dtype bfloat16       # 4B
-python run_guard.py --model Qwen/Qwen3Guard-Gen-8B --dtype bfloat16       # 8B（A10 24GB なら bfloat16 が必要）
+python run_guard.py                                                       # Qwen3Guard-Gen-0.6B（float32）
+python run_guard.py --model Qwen/Qwen3Guard-Gen-8B --batch-size 16        # 0.6B 以外は既定で bfloat16
 ```
+
+対応しているモデル（入力・出力の形式は各モデルカードどおり。`guards.py` 参照）：
+
+| モデル | 元のモデル | 日本語 | 出力 → 判定 |
+|---|---|---|---|
+| `Qwen/Qwen3Guard-Gen-0.6B` / `4B` / `8B` | Qwen3 | 対応（119言語） | Safe / Unsafe / Controversial |
+| `meta-llama/Llama-Guard-3-8B` ※ | Llama 3.1 | 公式には非対応 | safe / unsafe |
+| `nvidia/Llama-3.1-Nemotron-Safety-Guard-8B-v3` | Llama 3.1 | 対応（9言語） | JSON の "User Safety" |
+| `ricoh-ai/Llama-Ricoh-SafeGuard-20260520` ※ | Llama 3.1 Swallow | 日本語特化 | Llama Guard 3 と同じ形式と想定（同意後に要確認） |
+| `mistralai/Shieldstral-1.0-3B` | Ministral 3 | 対応（12言語） | p(yes) > 0.5 で unsafe（生成せず1回の forward） |
+| `ToxicityPrompts/PolyGuard-Ministral` | Ministral | 対応（17言語） | Harmful request: yes / no |
+
+- ※ Hugging Face で利用規約への同意が必要（Llama Guard 3 は Meta の手動承認、リコーは自動承認）。同意後、実行するマシンで `hf auth login`。
+- Qwen3Guard 以外には Controversial がないので strict と loose は同じ値になる。Shieldstral は確率を `score` 列に残す。
+- Shieldstral には `mistral-common` が必要（requirements.txt に記載）。
+- PolyGuard は WildGuardMix（WildGuardTest と同じ元データ）の翻訳で学習しているので、このデータでは有利な可能性がある。
+- Shieldstral のモデルカードには「翻字（transliterated）されたテキストでは信頼性が下がる」と書かれている（romaji の条件に関係）。
+- 新しいモデルは、まず `--limit 20 --conditions original` で元の文の判定精度を確認してから全件を回す。
 
 - `data/perturbed_v4.jsonl` の `text_perturbed` をそのまま user メッセージとしてチャットテンプレートに入れる（判定中に変換はしない）。
 - 出力はモデルごとに `outputs/predictions_<モデル名>_v4.csv`（例：`predictions_qwen3guard-8b_v4.csv`）。GPU では `--batch-size` を大きくすると速い。
