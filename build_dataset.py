@@ -2,7 +2,11 @@
 
 出力:
   data/sample_v2.csv / .jsonl     抽出データ（既定は adversarial==False でラベルのある行を全件。元データの全列＋行番号 id）
-  data/perturbed_v4.csv / .jsonl  抽出データ × 14条件（バージョンは common.DATA_VERSION）の変換済みデータセット
+  data/perturbed_v5.csv / .jsonl  抽出データ × 66条件の変換済みデータセット（--data-version v4 なら perturbed_v4 × 14条件）
+
+使い方:
+  python build_dataset.py                    # v5（割合スイープ＋組み合わせ。既定）
+  python build_dataset.py --data-version v4  # v4（14条件）を作り直す（同じ seed・辞書なら同じ結果）
 
 --n-per-class N を付けると、v1 と同じく harmful・unharmful を N 件ずつ seed 固定で抽出する（試し用）。
 """
@@ -19,17 +23,18 @@ from common import (
     DATA_DIR,
     DATASET_NAME,
     DICT_DIR,
+    DATA_VERSION,
+    DATA_VERSIONS,
     HARMFUL_VALUE,
-    PERTURBED_CSV,
-    PERTURBED_JSONL,
     SAMPLE_CSV,
     SAMPLE_JSONL,
     SEED,
     UNHARMFUL_VALUE,
+    perturbed_paths,
     set_seed,
     write_jsonl,
 )
-from perturb.conditions import CONDITIONS, perturb
+from perturb.conditions import conditions_for, perturb
 from perturb.homophone import HomophoneDict, download_jmdict_common
 from perturb.morph import tokenize
 
@@ -79,12 +84,12 @@ def sample(df: pd.DataFrame, n_per_class: int | None, seed: int) -> pd.DataFrame
     return out
 
 
-def build_perturbed(sample_df: pd.DataFrame, hdict: HomophoneDict, seed: int) -> pd.DataFrame:
+def build_perturbed(sample_df: pd.DataFrame, hdict: HomophoneDict, seed: int, conditions: list[str]) -> pd.DataFrame:
     rows = []
     for rec in tqdm(sample_df.to_dict(orient="records"), desc="perturb"):
         text = rec["prompt"]
         tokens = tokenize(text)
-        for cond in CONDITIONS:
+        for cond in conditions:
             r = perturb(text, cond, seed=seed, item_id=rec["id"], homophone_dict=hdict, tokens=tokens)
             rows.append(
                 {
@@ -115,6 +120,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--n-per-class", type=int, default=None, help="各クラスの抽出件数（省略時は全件）")
     ap.add_argument("--seed", type=int, default=SEED)
+    ap.add_argument("--data-version", default=DATA_VERSION, choices=DATA_VERSIONS)
     ap.add_argument("--jmdict", type=str, default=None, help="jmdict-eng-common の JSON パス（省略時は data/dict に自動ダウンロード）")
     args = ap.parse_args()
 
@@ -132,10 +138,13 @@ def main() -> None:
     hdict = HomophoneDict.load(jm_path)
     print(f"[jmdict] {jm_path}  version={hdict.version}  readings={len(hdict.mapping)}")
 
-    pert = build_perturbed(smp, hdict, args.seed)
-    pert.to_csv(PERTURBED_CSV, index=False, encoding="utf-8")
-    write_jsonl(pert, PERTURBED_JSONL)
-    print(f"[save] {PERTURBED_CSV} / {PERTURBED_JSONL}  ({len(pert)} 行)")
+    conditions = conditions_for(args.data_version)
+    print(f"[perturb] データ {args.data_version}: {len(conditions)} 条件")
+    pert = build_perturbed(smp, hdict, args.seed, conditions)
+    out_csv, out_jsonl = perturbed_paths(args.data_version)
+    pert.to_csv(out_csv, index=False, encoding="utf-8")
+    write_jsonl(pert, out_jsonl)
+    print(f"[save] {out_csv} / {out_jsonl}  ({len(pert)} 行)")
 
     summ = pert.groupby("condition", sort=False).agg(
         n=("id", "size"),

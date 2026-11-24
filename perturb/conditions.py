@@ -21,6 +21,7 @@ from typing import Callable
 from .homophone import HomophoneDict
 from .kana import (
     has_japanese,
+    has_kanji,
     hira2kata,
     is_kana_reading,
     kana_to_romaji,
@@ -299,6 +300,8 @@ def perturb(
     homophone_dict: HomophoneDict | None = None,
     tokens: list[Token] | None = None,
 ) -> PerturbResult:
+    if "@" in condition:  # v5 の条件（例：hira@25、romaji+replacement@50）
+        return _perturb_v5(text, condition, seed, item_id, homophone_dict, tokens)
     if condition not in CONDITIONS:
         raise ValueError(f"unknown condition: {condition}")
     if condition == "homophone" and homophone_dict is None:
@@ -367,6 +370,171 @@ def perturb(
     )
 
 
-def perturb_all(text: str, seed: int = 42, item_id=0, homophone_dict: HomophoneDict | None = None) -> list[PerturbResult]:
+def perturb_all(
+    text: str, seed: int = 42, item_id=0, homophone_dict: HomophoneDict | None = None, conditions: list[str] | None = None
+) -> list[PerturbResult]:
     tokens = tokenize(text)
-    return [perturb(text, c, seed, item_id, homophone_dict, tokens=tokens) for c in CONDITIONS]
+    return [perturb(text, c, seed, item_id, homophone_dict, tokens=tokens) for c in (conditions or CONDITIONS)]
+
+
+# ===========================================================================
+# v5：割合スイープ（10/25/50/75/100%）と、手法の組み合わせ
+# ===========================================================================
+# 条件名は「手法@割合」。手法は単独（hira）か、1 語に重ねる組み合わせ（romaji+replacement）。
+#   - 割合は内容語に対する割合（v4 の 10% と同じ丸め：max(1, 四捨五入)。変換できる語が足りなければ全部）
+#   - 語の選び方：1 文につき内容語の並び順を 1 つだけ乱数で決め、全手法・全割合で共有する。
+#     各条件はその順で「その手法で変換できる語」を先頭から k 語取る
+#     → 割合が入れ子になる（25% で変えた語は 50% でも変わる）・手法が違ってもなるべく同じ語を変える
+#   - 誤字の乱数は「文・手法・語の位置」ごと → 同じ語は割合が違っても同じ誤字になる
+CONDITIONS_V4 = CONDITIONS
+V5_SINGLE = ["hira", "kata", "hankata", "romaji", "transposition", "replacement", "homophone", "split"]
+V5_COMBOS = ["romaji+replacement", "romaji+transposition", "kata+split", "hankata+split", "homophone+hira"]
+V5_METHODS = [*V5_SINGLE, *V5_COMBOS]
+V5_RATES = [10, 25, 50, 75, 100]
+CONDITIONS_V5 = ["original", *[f"{m}@{r}" for m in V5_METHODS for r in V5_RATES]]
+CONDITIONS_BY_VERSION = {"v4": CONDITIONS_V4, "v5": CONDITIONS_V5}
+SCRIPTS = ("hira", "kata", "hankata", "romaji")
+SPLIT_CHAR_HANKAKU = "･"  # hankata+split の区切り（半角の中黒）
+
+
+def conditions_for(version: str) -> list[str]:
+    if version not in CONDITIONS_BY_VERSION:
+        raise ValueError(f"unknown data version: {version}（{', '.join(CONDITIONS_BY_VERSION)}）")
+    return CONDITIONS_BY_VERSION[version]
+
+
+def parse_condition(condition: str) -> tuple[str, int]:
+    """'romaji+replacement@25' → ('romaji+replacement', 25)。v5 の条件名だけを受け付ける。"""
+    method, sep, rate = condition.partition("@")
+    if not sep or method not in V5_METHODS or not rate.isdigit() or not 0 < int(rate) <= 100:
+        raise ValueError(f"unknown v5 condition: {condition}")
+    return method, int(rate)
+
+
+def n_targets(n_content: int, rate: int) -> int:
+    """内容語の rate%（四捨五入、最低1語）。rate=10 では n_partial_targets と同じ値。"""
+    if n_content == 0:
+        return 0
+    return max(1, (n_content * rate + 50) // 100)
+
+
+def _typo_replace_romaji(rom: str, rng: random.Random) -> tuple[str, dict] | None:
+    """ローマ字の綴りの 1 文字を置換（母音→別の母音・子音→別の子音）。かなには戻さない。"""
+    idxs = [i for i, c in enumerate(rom) if c in VOWELS or c in CONSONANTS]
+    if not idxs:
+        return None
+    i = rng.choice(idxs)
+    c = rom[i]
+    r = rng.choice([x for x in (VOWELS if c in VOWELS else CONSONANTS) if x != c])
+    return rom[:i] + r + rom[i + 1:], {"romaji": rom, "replace": [i, c, r]}
+
+
+def _typo_swap_romaji(rom: str, rng: random.Random) -> tuple[str, dict] | None:
+    """ローマ字の綴りの 2 文字（異なる文字）を入れ替え。かなには戻さない。"""
+    idxs = [i for i, c in enumerate(rom) if c.isascii() and c.isalpha()]
+    if len({rom[i] for i in idxs}) < 2:
+        return None
+    for _ in range(MAX_TRIES):
+        i, j = sorted(rng.sample(idxs, 2))
+        if rom[i] != rom[j]:
+            lst = list(rom)
+            lst[i], lst[j] = lst[j], lst[i]
+            return "".join(lst), {"romaji": rom, "swap": [i, j]}
+    return None
+
+
+def _split_units(s: str, sep: str) -> str:
+    """1 文字ずつ区切る。半角カナの濁点・半濁点（ﾞﾟ）は前の字から離さない（ﾊﾞ・ｸ → ﾊﾞ･ｸ）。"""
+    units: list[str] = []
+    for ch in s:
+        if ch in "ﾞﾟ" and units:
+            units[-1] += ch
+        else:
+            units.append(ch)
+    return sep.join(units) if len(units) >= 2 else s
+
+
+def _apply_v5(method: str, tok: Token, nxt: Token | None, rng_for: Callable[[str], random.Random],
+              hdict: HomophoneDict | None) -> tuple[str, dict] | None:
+    """1 語に手法を適用した表記（変えられなければ None）。info["method"] に実際に使った手法を入れる。
+    rng_for(手法名) はその語・その手法専用の乱数（homophone+hira の同音異字は homophone と同じ乱数 → 同じ字になる）。"""
+    if method in SCRIPTS:
+        new = convert_script(tok, method, nxt)
+        return (new, {"kind": "content", "method": method}) if new != tok.surface else None
+    if method in ("transposition", "replacement", "split"):
+        fn = {"transposition": _perturb_transposition, "replacement": _perturb_replacement, "split": _perturb_split}[method]
+        res = fn(tok, rng_for(method))
+    elif method == "homophone":
+        res = _make_homophone(hdict)(tok, rng_for(method))
+    elif method in ("romaji+replacement", "romaji+transposition"):
+        rom = convert_script(tok, "romaji", nxt)
+        res = (_typo_replace_romaji if method.endswith("replacement") else _typo_swap_romaji)(rom, rng_for(method))
+    elif method in ("kata+split", "hankata+split"):
+        script = method.split("+")[0]
+        conv = convert_script(tok, script, nxt)
+        if has_kanji(conv):  # 読みが取れずカタカナにできない語（簡体字など）は区切らない
+            return None
+        new = _split_units(conv, SPLIT_CHAR if script == "kata" else SPLIT_CHAR_HANKAKU)
+        res = (new, {}) if new != tok.surface else None
+    elif method == "homophone+hira":  # 同音異字の候補があれば同音異字、なければひらがな
+        res = _apply_v5("homophone", tok, nxt, rng_for, hdict) if _eligible(tok, "homophone", hdict) else None
+        return res or _apply_v5("hira", tok, nxt, rng_for, hdict)
+    else:
+        raise ValueError(method)
+    if res is None:
+        return None
+    new, info = res
+    return (new, {**info, "method": method}) if new != tok.surface else None
+
+
+def _eligible_v5(tok: Token, method: str, hdict: HomophoneDict | None) -> bool:
+    """その語に手法を適用できるか（乱数を消費しない判定のみ）。"""
+    if method in SCRIPTS:
+        return convert_script(tok, method) != tok.surface
+    if method in ("transposition", "replacement", "split", "homophone"):
+        return _eligible(tok, method, hdict)
+    if method == "romaji+replacement":
+        return any(c in VOWELS or c in CONSONANTS for c in convert_script(tok, "romaji"))
+    if method == "romaji+transposition":
+        return len({c for c in convert_script(tok, "romaji") if c.isascii() and c.isalpha()}) >= 2
+    if method in ("kata+split", "hankata+split"):
+        script = method.split("+")[0]
+        sep = SPLIT_CHAR if script == "kata" else SPLIT_CHAR_HANKAKU
+        conv = convert_script(tok, script)
+        return not has_kanji(conv) and _split_units(conv, sep) != tok.surface
+    if method == "homophone+hira":
+        return _eligible(tok, "homophone", hdict) or convert_script(tok, "hira") != tok.surface
+    raise ValueError(method)
+
+
+def _perturb_v5(text: str, condition: str, seed: int, item_id, hdict: HomophoneDict | None,
+                tokens: list[Token] | None) -> PerturbResult:
+    method, rate = parse_condition(condition)
+    if "homophone" in method and hdict is None:
+        raise ValueError(f"{condition} requires homophone_dict")
+    tokens = tokens if tokens is not None else tokenize(text)
+    content = content_indices(tokens)
+    order = list(content)
+    make_rng(seed, item_id, "v5|order").shuffle(order)  # 全手法・全割合で共有する並び順
+    k = n_targets(len(content), rate)
+    selected = sorted([i for i in order if _eligible_v5(tokens[i], method, hdict)][:k])
+    changes: dict[int, Change] = {}
+    for i in selected:
+        t = tokens[i]
+        res = _apply_v5(method, t, _next(tokens, i), lambda m, i=i: make_rng(seed, item_id, f"v5|{m}|{i}"), hdict)
+        if res is None:
+            changes[i] = Change(t.surface, t.surface, t.pos1, t.reading, t.start, changed=False, info={"method": method})
+        else:
+            new, info = res
+            changes[i] = Change(t.surface, new, t.pos1, t.reading, t.start, changed=True, info=info)
+    new_text = _rebuild(text, tokens, changes)
+    ordered = [changes[i] for i in sorted(changes)]
+    return PerturbResult(
+        condition=condition,
+        text_original=text,
+        text_perturbed=new_text,
+        n_content=len(content),
+        n_target=len(selected),
+        n_changed=sum(c.changed for c in ordered),
+        changes=ordered,
+    )

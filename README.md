@@ -1,6 +1,6 @@
 # 日本語ガードレールの表記揺れ頑健性：予備実験
 
-WildGuardTestJP のプロンプトに日本語の表記揺れ・誤字（v4 は14条件）を加え、
+WildGuardTestJP のプロンプトに日本語の表記揺れ・誤字（v4 は14条件、v5 は割合スイープと組み合わせの66条件）を加え、
 ガードモデル（Qwen3Guard-Gen 0.6B / 4B / 8B ほか、系統の異なる5種類）のプロンプト判定（見逃し＝FNR・誤検出＝FPR）がどう変わるかを調べる。
 主題は表記揺れ（同じ語・同じ読みで文字種だけが違う）。誤字系の条件も同じ系列の条件として並べて扱う（グループを分けた集計はしない）。
 **変換と判定は完全に分離**しており、変換済みデータセットを先に作り、確認してから判定に回す。
@@ -11,14 +11,14 @@ WildGuardTestJP のプロンプトに日本語の表記揺れ・誤字（v4 は1
 ## 構成
 
 ```
-build_dataset.py      1. データ抽出（903件）＋ 14条件の変換 → data/
+build_dataset.py      1. データ抽出（903件）＋ 変換（v5：66条件／--data-version v4：14条件） → data/
 validate_dataset.py   2. 変換の自動チェック ＋ 目視確認用 CSV の出力・集計
 run_guard.py          3. ガードモデルによる判定（--model で切り替え、再開可能、--limit で試運転）
 guards.py             モデルごとの入力の作り方・出力の読み取り方
 analyze.py            4. FNR/FPR・Wilson CI・McNemar 検定・Controversial の割合・トークン数・グラフ
 perturb/              変換ロジック（kana.py, morph.py, homophone.py, conditions.py）
 common.py             パス・seed など共通設定
-tests/                変換関数の単体テスト（無害な例文のみを使用）
+tests/                変換関数の単体テスト（無害な例文のみを使用。v5 を足しても v4 のデータが変わらないことも確認）
 requirements.txt      依存パッケージ（requirements-lock.txt は動作確認したバージョンの固定版）
 ```
 
@@ -33,7 +33,8 @@ python -m pytest -q tests         # 変換関数の単体テスト
 ```
 
 - デバイスは自動判定（CUDA → MPS → CPU の順）。モデルは既定で float32 で読み込む（`--dtype bfloat16` で変更可。8B を 24GB の GPU に載せる場合は必須）。
-- 乱数は seed=42 で固定。変換の乱数は `(seed, id, condition)` から作るため、処理順や件数に依存しない（再実行で `data/perturbed_v4.jsonl` がバイト単位で一致することを確認済み）。
+- 乱数は seed=42 で固定。変換の乱数は `(seed, id, condition)` から作るため、処理順や件数に依存しない（再実行で `data/perturbed_v4.jsonl` がバイト単位で一致することを確認済み。v5 を追加した後も `build_dataset.py --data-version v4` で同じファイルになる）。
+- **データのバージョンは各スクリプトの `--data-version` で選ぶ（既定は v5）**。v4 の結果を扱うときは `--data-version v4` を付ける。
 - `sbintuitions/WildGuardTestJP` にアクセスできない場合は `huggingface-cli login` を実行する。
 
 ## 実行手順
@@ -45,16 +46,16 @@ python -m pytest -q tests         # 変換関数の単体テスト
 ```bash
 python build_dataset.py                 # 数十秒（初回は JMdict を data/dict/ にダウンロード）
 python validate_dataset.py
-python run_guard.py --limit 10          # 各条件 10件（有害5・無害5）×14条件 → outputs/predictions_qwen3guard-0.6b_v4_limit10.csv
-python analyze.py --predictions outputs/predictions_qwen3guard-0.6b_v4_limit10.csv
-#   → outputs/summary_qwen3guard-0.6b_v4_limit10.csv, outputs/fnr_fpr_qwen3guard-0.6b_v4_limit10.png
+python run_guard.py --limit 10          # 各条件 10件（有害5・無害5）×66条件 → outputs/predictions_qwen3guard-0.6b_v5_limit10.csv
+python analyze.py --predictions outputs/predictions_qwen3guard-0.6b_v5_limit10.csv
+#   → outputs/summary_qwen3guard-0.6b_v5_limit10.csv, outputs/sweep_fnr_qwen3guard-0.6b_v5_limit10.png ほか
 ```
 
 `--limit` 付きの結果は別ファイル（`*_limit10.csv`）に保存されるので、本番の結果とは混ざらない。
 
 ### データのバージョン
 
-変換仕様を変えたら `common.py` の `DATA_VERSION` を上げる。変換データ・判定結果・集計のファイル名にバージョンが付く。
+変換仕様を変えたら `common.py` の `DATA_VERSIONS` に追加し、`DATA_VERSION`（既定）を上げる。変換データ・判定結果・集計のファイル名にバージョンが付く。
 抽出データは `SAMPLE_VERSION` で管理する（`sample_v1`＝200件抽出：データ v1〜v3、`sample_v2`＝全件：データ v4〜）。
 
 | 版 | 変更点 |
@@ -62,7 +63,8 @@ python analyze.py --predictions outputs/predictions_qwen3guard-0.6b_v4_limit10.c
 | v1 | 内容語＝名詞・動詞・形容詞。hira100 で「性的」「不適切」などが漢字のまま残った（200文中154文） → `outputs/v1/` に保管 |
 | v2 | 内容語に**形状詞**を追加。hira100/romaji100 は内容語＋**漢字を含むすべての語**（接頭辞・接尾辞・代名詞・副詞など）を変換し、文中に漢字が残らない |
 | v3 | homophone の対象を**漢字を含む名詞**に限定。v2 では「ため→為」「ページ→頁」など同じ語の漢字化が 299件中80件あった。同一語の判定に common 以外の異表記も使う |
-| **v4（現行）** | 抽出を200件から**全件（903件）**に。条件を14に拡張：**kata100・hankata100・romaji100_space**、内容語10%だけ変える **hira10・kata10・hankata10・romaji10** を追加。**romaji100 は助詞・助動詞・句読点も含めて文全体を変換**（v3 は `asuのkaigiにsankashiます` と助詞がかなのまま残っていた）。ローマ字化を pykakasi から独自の表示用ヘボン式に（v3 は タトゥー→tatouu など）。「私」の読みを わたくし→**わたし** に。読みが取れない語（元データに混じった簡体字など）を消さずに残す（v3 の hira100 では消えていた） |
+| **v4** | 抽出を200件から**全件（903件）**に。条件を14に拡張：**kata100・hankata100・romaji100_space**、内容語10%だけ変える **hira10・kata10・hankata10・romaji10** を追加。**romaji100 は助詞・助動詞・句読点も含めて文全体を変換**（v3 は `asuのkaigiにsankashiます` と助詞がかなのまま残っていた）。ローマ字化を pykakasi から独自の表示用ヘボン式に（v3 は タトゥー→tatouu など）。「私」の読みを わたくし→**わたし** に。読みが取れない語（元データに混じった簡体字など）を消さずに残す（v3 の hira100 では消えていた） |
+| **v5（現行）** | v4 はそのまま残し、別のデータセットとして作る。**割合スイープ**（8手法 × 内容語の 10/25/50/75/100%）と、1語に2つの手法を重ねる**組み合わせ**（5種 × 同じ5段階）の66条件。詳しくは下の「v5 の条件」 |
 
 ### 1. データ抽出と変換
 
@@ -133,7 +135,8 @@ python run_guard.py --model Qwen/Qwen3Guard-Gen-8B --batch-size 16        # 0.6B
   - パースできなかった行は `parse_error=1`、pred は空欄（集計では除外し件数を報告）
 - バッチごとに出力 CSV に追記。**途中で止めても同じコマンドで再開**できる（処理済みの `(id, condition)` はスキップ。入力データが変わっていたらエラーで止まる）。
 - 実行条件（モデル・デバイス・dtype・GPU 名・バージョン等）は `outputs/predictions_<モデル名>_v4.meta.json` に保存。
-- 所要時間の目安：M系 Mac（MPS）・0.6B で1件あたり約1秒 → v4 全12,642行で3〜4時間。A10 での時間は未計測。
+- 所要時間の目安：M系 Mac（MPS）・0.6B で1件あたり約1.5秒。A10（研究室サーバー）では v4 全12,642行 × 7モデルで約7時間15分（1モデル平均約1時間）。
+- **v5 は `--labels harmful` で有害だけを先に判定できる**（FNR だけを見る割合スイープ向け。A10 で7モデル約15時間の見積もり）。あとで `--labels` を外して同じコマンドを実行すると、無害の分だけが追加される。`meta.json` は最後の実行の条件で上書きされる。
 
 ### 4. 集計
 
@@ -148,6 +151,35 @@ python analyze.py --predictions outputs/predictions_qwen3guard-8b_v4.csv  # 別�
 - `outputs/summary_long_<モデル名>_v4.csv`：同じ内容の縦持ち版（McNemar の不一致セル数 b/c を含む）
 - `outputs/per_class_<モデル名>_v4.csv`：クラス別の正答率・適合率・F1
 - `outputs/fnr_fpr_<モデル名>_v4.png`：条件ごとの FNR/FPR の棒グラフ（strict/loose、誤差棒は Wilson 95% CI）
+- v5 では棒グラフの代わりに `outputs/sweep_fnr_<モデル名>_v5.png`（無害も判定していれば `sweep_fpr_…png` も）：手法ごとの小さなグラフで、横軸＝変換した内容語の割合（0%＝original）。組み合わせの手法には、構成する単独の手法を灰色の破線・点線で重ねる
+- 有害だけの結果でも動く（FPR は NaN になる）
+- v5 は条件が65あるので、Holm 補正の族も65条件（v4 より保守的になる）
+
+## v5 の条件（割合スイープと組み合わせ）
+
+条件名は **`手法@割合`**（例：`hira@25`、`romaji+replacement@50`）。v4 の条件名（`hira10` など）とは別物で、v4 のデータ・結果は変わらない。
+
+- **割合**：内容語に対する割合（10 / 25 / 50 / 75 / 100%）。語数は v4 の10%と同じ丸め（四捨五入、最低1語）。その手法で変換できる語が足りなければ、変換できる語を全部変える。
+- **語の選び方**：1文ごとに内容語の並び順を1つだけ乱数で決め、**全手法・全割合で共有**する。各条件はその順で「その手法で変換できる語」を先頭から取る。
+  - 割合が入れ子になる（25% で変えた語は 50% でも同じ表記に変わる。全データで確認済み）。割合を上げたときの変化が、語の選び直しによるノイズを含まない。
+  - 手法が違っても、なるべく同じ語を変える（どの手法でも変換できる語なら完全に同じ語）。
+- **誤字の乱数**は「文・手法・語の位置」ごと → 同じ語は割合が違っても同じ誤字になる。homophone+hira の同音異字も homophone と同じ字になる。
+- **100% は内容語だけ**を変える（助詞・助動詞は変えない）。文全体を変える v4 の hira100 などとは別。
+
+| 手法 | 1語への処理 | 例 |
+|---|---|---|
+| hira / kata / hankata / romaji | その文字種に（v4 の hira10 などと同じ変換） | 本→ほん／ホン／ﾎﾝ／hon |
+| transposition / replacement / split / homophone | v4 と同じ誤字の作り方 | 会議→kぎあい／かいし／会・議／懐疑 |
+| romaji+replacement | ローマ字にしてから綴りの1文字を同種の別文字に（かなには戻さない） | 会議→kaigi→kaegi |
+| romaji+transposition | ローマ字にしてから綴りの2文字（異なる文字）を入れ替え | 会議→kaigi→gaiki |
+| kata+split | カタカナにしてから1文字ずつ「・」で区切る | 会議→カ・イ・ギ |
+| hankata+split | 半角カナにしてから半角の「･」で区切る（濁点・半濁点は前の字から離さない） | 会議→ｶ･ｲ･ｷﾞ |
+| homophone+hira | 同音異字の候補がある名詞は同音異字、それ以外はひらがな | 明日の会議に参加します→あすの懐疑に酸化します |
+
+- **homophone は候補のある名詞が少ない**（1文あたり平均2.1語。903件中167件は候補なし）ため、homophone@50 以上はほぼ同じ文になる。割合スイープで homophone の曲線が早く頭打ちになるのはこのため。
+- 読みが取れずカタカナにできない語（簡体字など）は kata+split / hankata+split の対象にしない。
+- v5 の検証結果（903件×66条件）：問題として出るのは、homophone の全割合で候補のある名詞がない167件と、kata の全割合で内容語がすべてカタカナ語の3件だけ。
+- 目視確認用の `outputs/manual_check_v5.csv` は条件ごと5件（65条件×5＝325行）。
 
 ## 14条件の仕様（v4）
 

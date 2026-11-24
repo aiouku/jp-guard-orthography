@@ -28,9 +28,20 @@ SAMPLE_JSONL = DATA_DIR / f"sample_{SAMPLE_VERSION}.jsonl"
 #   v3: homophone の対象を「漢字を含む名詞」に限定（v2 では ため→為 など同じ語の漢字化が 299件中80件）
 #   v4: 抽出を全件に。文字種変換を14条件に拡張（kata100・hankata100・romaji100_space・10%版を追加、
 #       romaji100 は助詞・助動詞・句読点も含めて文全体を変換）。「私」の読みを わたし に
-DATA_VERSION = "v4"
-PERTURBED_CSV = DATA_DIR / f"perturbed_{DATA_VERSION}.csv"
-PERTURBED_JSONL = DATA_DIR / f"perturbed_{DATA_VERSION}.jsonl"
+#   v5: v4 はそのまま残し、割合スイープ（10/25/50/75/100%）と手法の組み合わせの66条件を別に作る
+#       （条件の一覧は perturb.conditions.CONDITIONS_V5。各スクリプトの --data-version v4 で v4 を扱える）
+DATA_VERSIONS = ("v4", "v5")
+DATA_VERSION = "v5"  # 既定のバージョン
+
+
+def perturbed_paths(version: str = DATA_VERSION) -> tuple[Path, Path]:
+    """変換済みデータセットの (CSV, JSONL) のパス。"""
+    if version not in DATA_VERSIONS:
+        raise ValueError(f"unknown data version: {version}（{', '.join(DATA_VERSIONS)}）")
+    return DATA_DIR / f"perturbed_{version}.csv", DATA_DIR / f"perturbed_{version}.jsonl"
+
+
+PERTURBED_CSV, PERTURBED_JSONL = perturbed_paths(DATA_VERSION)
 
 HARMFUL_VALUE = "harmful"
 UNHARMFUL_VALUE = "unharmful"

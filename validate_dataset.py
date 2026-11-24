@@ -1,8 +1,9 @@
 """2. 変換済みデータセットの自動チェックと、目視確認用ファイルの出力・集計。
 
 使い方:
-  python validate_dataset.py                       # 自動チェック＋ outputs/manual_check_v4.csv を出力
-  python validate_dataset.py --score outputs/manual_check_v4.csv   # 記入済みファイルの ok 率を集計
+  python validate_dataset.py                       # v5 の自動チェック＋ outputs/manual_check_v5.csv を出力
+  python validate_dataset.py --data-version v4     # v4 のチェック（出力ファイル名も _v4）
+  python validate_dataset.py --score outputs/manual_check_v5.csv   # 記入済みファイルの ok 率を集計
 """
 from __future__ import annotations
 
@@ -14,8 +15,16 @@ from pathlib import Path
 
 import pandas as pd
 
-from common import DATA_VERSION, DICT_DIR, OUT_DIR, PERTURBED_JSONL, SEED, load_perturbed
-from perturb.conditions import FULL_SCRIPT, PARTIAL_CONDITIONS, PARTIAL_SCRIPT, UNCOUNTED_KINDS
+from common import DATA_VERSION, DATA_VERSIONS, DICT_DIR, OUT_DIR, SEED, load_perturbed, perturbed_paths
+from perturb.conditions import (
+    FULL_SCRIPT,
+    PARTIAL_CONDITIONS,
+    PARTIAL_SCRIPT,
+    SCRIPTS,
+    SPLIT_CHAR,
+    SPLIT_CHAR_HANKAKU,
+    UNCOUNTED_KINDS,
+)
 from perturb.homophone import HomophoneDict
 from perturb.kana import has_japanese, has_kanji, is_ascii_alpha, kata2hira
 from perturb.morph import tokenize
@@ -42,8 +51,29 @@ def script_violations(script: str, s: str) -> str:
         bad.append("hankaku")
     return ",".join(bad)
 
-N_MANUAL = 20
-MANUAL_CSV = OUT_DIR / f"manual_check_{DATA_VERSION}.csv"
+N_MANUAL = {"v4": 20, "v5": 5}  # 目視確認で条件ごとに出す件数（v5 は条件が66あるので少なめ）
+
+
+def word_rule(cond: str, change: dict) -> tuple[str, str] | None:
+    """変換した 1 語が満たすべき文字種と、取り除いてから調べる区切り文字。調べない語は None。
+    v4 は条件名から、v5 は語ごとに記録した実際の手法（info.method）から決める。"""
+    script = FULL_SCRIPT.get(cond) or PARTIAL_SCRIPT.get(cond)
+    if script:
+        return script, ""
+    method = change["info"].get("method", "")
+    if method in SCRIPTS:
+        return method, ""
+    if method.startswith("romaji+"):
+        return "romaji", ""
+    if method == "kata+split":
+        return "kata", SPLIT_CHAR
+    if method == "hankata+split":
+        return "hankata", SPLIT_CHAR_HANKAKU
+    return None
+
+
+def is_homophone_change(cond: str, change: dict) -> bool:
+    return cond == "homophone" or change["info"].get("method") == "homophone"
 
 
 def _detail(row) -> list[dict]:
@@ -66,7 +96,7 @@ def find_issues(df: pd.DataFrame, hdict: HomophoneDict | None) -> pd.DataFrame:
             continue
         if row["text_perturbed"] == row["text_original"]:
             add(row, "unchanged_text")
-        if cond in PARTIAL_CONDITIONS and row["n_changed"] == 0:
+        if (cond in PARTIAL_CONDITIONS or "@" in cond) and row["n_changed"] == 0:
             add(row, "n_changed_zero", f"n_content={row.get('n_content')}")
         for c in det:
             if c["orig"].strip() and not c["new"].strip():
@@ -76,24 +106,26 @@ def find_issues(df: pd.DataFrame, hdict: HomophoneDict | None) -> pd.DataFrame:
             seg = row["text_perturbed"][c["start_new"]: c["start_new"] + len(c["new"])]
             if seg != c["new"]:
                 add(row, "offset_mismatch", f"{c['orig']}→{c['new']}")
-        script = FULL_SCRIPT.get(cond) or PARTIAL_SCRIPT.get(cond)
         if cond in FULL_SCRIPT:
             # 文全体：その文字種以外の日本語の文字が1字も残っていないか
-            bad = script_violations(script, row["text_perturbed"])
+            bad = script_violations(FULL_SCRIPT[cond], row["text_perturbed"])
             if bad:
                 add(row, f"{cond}_other_script_in_text", bad)
-        if script:
-            # 変換した語：その文字種だけになっているか（ローマ字は英字のみ）
+        # 変換した語：その文字種だけになっているか（ローマ字は英字のみ。区切り文字は除いて調べる）
+        for c in det:
+            if not c["changed"] or c["info"].get("kind") in UNCOUNTED_KINDS:
+                continue
+            rule = word_rule(cond, c)
+            if rule is None:
+                continue
+            script, sep = rule
+            new = c["new"].strip().replace(sep, "") if sep else c["new"].strip()
+            bad = ("not_alpha" if not is_ascii_alpha(new) else "") if script == "romaji" else script_violations(script, new)
+            if bad:
+                add(row, f"{cond}_word_not_converted", f"{c['orig']}→{c['new'].strip()} ({bad})")
+        if cond == "homophone" or "homophone" in cond:
             for c in det:
-                if not c["changed"] or c["info"].get("kind") in UNCOUNTED_KINDS:
-                    continue
-                new = c["new"].strip()
-                bad = ("not_alpha" if not is_ascii_alpha(new) else "") if script == "romaji" else script_violations(script, new)
-                if bad:
-                    add(row, f"{cond}_word_not_converted", f"{c['orig']}→{new} ({bad})")
-        if cond == "homophone":
-            for c in det:
-                if not c["changed"]:
+                if not c["changed"] or not is_homophone_change(cond, c):
                     continue
                 if c["new"] == c["orig"]:
                     add(row, "homophone_same_word", c["orig"])
@@ -106,9 +138,11 @@ def find_issues(df: pd.DataFrame, hdict: HomophoneDict | None) -> pd.DataFrame:
 
 
 def homophone_sudachi_check(df: pd.DataFrame) -> pd.DataFrame:
-    """参考：置換後の語を Sudachi で単独解析したときの読みが元の読みと一致するか（不一致は警告扱い）。"""
+    """参考：置換後の語を Sudachi で単独解析したときの読みが元の読みと一致するか（不一致は警告扱い）。
+    v5 は homophone@100 だけを見る（ほかの割合・homophone+hira の同音異字は、同じ語なら同じ字なのでこれに含まれる）。"""
     rows = []
-    for _, row in df[df["condition"] == "homophone"].iterrows():
+    cond = "homophone" if (df["condition"] == "homophone").any() else "homophone@100"
+    for _, row in df[df["condition"] == cond].iterrows():
         for c in _detail(row):
             if not c["changed"]:
                 continue
@@ -153,7 +187,7 @@ def mark_changes(row) -> str:
     return text
 
 
-def write_manual_check(df: pd.DataFrame, path: Path, seed: int, force: bool) -> None:
+def write_manual_check(df: pd.DataFrame, path: Path, seed: int, force: bool, n_per_cond: int = 20) -> None:
     if path.exists() and not force:
         old = pd.read_csv(path, encoding="utf-8-sig")
         if old["review"].notna().any():
@@ -161,7 +195,7 @@ def write_manual_check(df: pd.DataFrame, path: Path, seed: int, force: bool) -> 
             return
     parts = []
     for cond, g in df[df["condition"] != "original"].groupby("condition", sort=False):
-        s = g.sample(n=min(N_MANUAL, len(g)), random_state=seed).sort_values("id")
+        s = g.sample(n=min(n_per_cond, len(g)), random_state=seed).sort_values("id")
         parts.append(s)
     m = pd.concat(parts)
     out = pd.DataFrame({
@@ -175,7 +209,7 @@ def write_manual_check(df: pd.DataFrame, path: Path, seed: int, force: bool) -> 
         "memo": "",
     })
     out.to_csv(path, index=False, encoding="utf-8-sig")  # Excel で文字化けしないよう BOM 付き
-    print(f"[manual] {path} に {len(out)} 行を出力（条件ごと {N_MANUAL} 件）。review 列に ok / ng を記入してください")
+    print(f"[manual] {path} に {len(out)} 行を出力（条件ごと {n_per_cond} 件）。review 列に ok / ng を記入してください")
 
 
 def score_manual(path: Path) -> pd.DataFrame:
@@ -194,33 +228,35 @@ def score_manual(path: Path) -> pd.DataFrame:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--input", type=Path, default=PERTURBED_JSONL)
+    ap.add_argument("--data-version", default=DATA_VERSION, choices=DATA_VERSIONS)
+    ap.add_argument("--input", type=Path, default=None, help="省略時は data/perturbed_<data-version>.jsonl")
     ap.add_argument("--score", type=Path, default=None, help="記入済みの manual_check.csv を集計する")
     ap.add_argument("--force", action="store_true", help="記入済みの manual_check.csv でも上書きする")
     ap.add_argument("--seed", type=int, default=SEED)
     args = ap.parse_args()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    ver = args.data_version
 
     if args.score:
         res = score_manual(args.score)
-        out = OUT_DIR / f"manual_check_score_{DATA_VERSION}.csv"
+        out = OUT_DIR / f"manual_check_score_{ver}.csv"
         res.to_csv(out, index=False)
         print(res.to_string(index=False))
         print(f"[save] {out}")
         return
 
-    df = load_perturbed(args.input)
+    df = load_perturbed(args.input or perturbed_paths(ver)[1])
     jm = sorted(DICT_DIR.glob("jmdict-eng-common-*.json"))
     hdict = HomophoneDict.load(jm[-1]) if jm else None
     if hdict is None:
         print("[warn] JMdict が見つからないため homophone の読みチェックを省略します", file=sys.stderr)
 
     issues = find_issues(df, hdict)
-    issues.to_csv(OUT_DIR / f"validation_issues_{DATA_VERSION}.csv", index=False, encoding="utf-8-sig")
+    issues.to_csv(OUT_DIR / f"validation_issues_{ver}.csv", index=False, encoding="utf-8-sig")
     summ = summarize(df, issues)
-    summ.to_csv(OUT_DIR / f"validation_summary_{DATA_VERSION}.csv", index=False)
+    summ.to_csv(OUT_DIR / f"validation_summary_{ver}.csv", index=False)
     hs = homophone_sudachi_check(df)
-    hs.to_csv(OUT_DIR / f"validation_homophone_sudachi_{DATA_VERSION}.csv", index=False, encoding="utf-8-sig")
+    hs.to_csv(OUT_DIR / f"validation_homophone_sudachi_{ver}.csv", index=False, encoding="utf-8-sig")
 
     print("[validation] 条件ごとの変換成功率:")
     print(summ.round(3).to_string(index=False))
@@ -231,10 +267,10 @@ def main() -> None:
         print("\n[validation] 問題は見つかりませんでした")
     if len(hs):
         print(f"\n[参考] homophone 置換語の Sudachi 読み一致率: {hs['match'].mean():.3f}（{len(hs)} 語）"
-              f" → outputs/validation_homophone_sudachi_{DATA_VERSION}.csv")
-    print(f"[save] {OUT_DIR / f'validation_summary_{DATA_VERSION}.csv'} / {OUT_DIR / f'validation_issues_{DATA_VERSION}.csv'}")
+              f" → outputs/validation_homophone_sudachi_{ver}.csv")
+    print(f"[save] {OUT_DIR / f'validation_summary_{ver}.csv'} / {OUT_DIR / f'validation_issues_{ver}.csv'}")
 
-    write_manual_check(df, MANUAL_CSV, args.seed, args.force)
+    write_manual_check(df, OUT_DIR / f"manual_check_{ver}.csv", args.seed, args.force, N_MANUAL[ver])
 
 
 if __name__ == "__main__":

@@ -6,8 +6,12 @@
 - トークン数の変化（平均・中央値）
 - Controversial（判断保留）と判定された割合（有害・無害それぞれ）
 
+- v5（条件名が「手法@割合」）は、棒グラフの代わりに手法ごとの「割合 → FNR / FPR」の折れ線グラフ（sweep_fnr_*.png）
+- 有害だけの結果（run_guard.py --labels harmful）でも動く（FPR は NaN、FPR のグラフは出さない）
+
 使い方:
-  python analyze.py                                                        # 既定：0.6B の全件結果
+  python analyze.py                                                        # 既定：0.6B の v5 の結果
+  python analyze.py --data-version v4                                      # 0.6B の v4 の結果
   python analyze.py --predictions outputs/predictions_qwen3guard-8b_v4.csv           # 別モデル
   python analyze.py --predictions outputs/predictions_qwen3guard-0.6b_v4_limit10.csv # 試運転の結果
 出力ファイル名は predictions_ を除いた部分を引き継ぐ（例：summary_qwen3guard-8b_v4.csv）。
@@ -28,11 +32,12 @@ from statsmodels.stats.contingency_tables import mcnemar  # noqa: E402
 from statsmodels.stats.multitest import multipletests  # noqa: E402
 from statsmodels.stats.proportion import proportion_confint  # noqa: E402
 
-from common import DATA_VERSION, OUT_DIR  # noqa: E402
-from perturb.conditions import CONDITIONS  # noqa: E402
+from common import DATA_VERSION, DATA_VERSIONS, OUT_DIR  # noqa: E402
+from perturb.conditions import CONDITIONS_V4, CONDITIONS_V5, V5_METHODS, V5_RATES  # noqa: E402
 
 PRED_PREFIX = "predictions"
-DEFAULT_PRED = OUT_DIR / f"{PRED_PREFIX}_qwen3guard-0.6b_{DATA_VERSION}.csv"
+# 集計・表示の並び順（v4 と v5 の条件をまとめた一覧。結果にある条件だけを使う）
+ALL_CONDITIONS = [*CONDITIONS_V4, *[c for c in CONDITIONS_V5 if c not in CONDITIONS_V4]]
 MODES = ["strict", "loose"]
 # metric -> (対象ラベル, 「誤り」とみなす予測値)
 METRICS = {"fnr": (1, 0), "fpr": (0, 1)}
@@ -57,7 +62,7 @@ def mcnemar_exact(err_base: np.ndarray, err_cond: np.ndarray) -> tuple[float, in
 
 
 def compute(pred: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    conds = [c for c in CONDITIONS if c in set(pred["condition"])]
+    conds = [c for c in ALL_CONDITIONS if c in set(pred["condition"])]
     if "original" not in conds:
         raise SystemExit("[error] original 条件の結果がないため比較できません")
     long_rows = []
@@ -127,7 +132,7 @@ def compute(pred: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 def plot(long: pd.DataFrame, out: Path, title_suffix: str = "", model: str = "Qwen3Guard-Gen-0.6B") -> None:
     colors = {"strict": "#2a78d6", "loose": "#eb6834"}  # 検証済みの2色（色覚多様性に配慮）
     ink, muted, grid, surface = "#1f1f1e", "#6b6a64", "#e4e3de", "#fcfcfb"
-    conds = [c for c in CONDITIONS if c in set(long["condition"])]
+    conds = [c for c in ALL_CONDITIONS if c in set(long["condition"])]
     titles = {"fnr": "Harmful prompts: miss rate (FNR, judged safe)",
               "fpr": "Benign prompts: false-positive rate (FPR, judged unsafe)"}
     # 条件数が多い（v4 は14条件）ので2段組み
@@ -155,11 +160,89 @@ def plot(long: pd.DataFrame, out: Path, title_suffix: str = "", model: str = "Qw
         ax.tick_params(colors=muted)
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, frameon=False, loc="upper left", bbox_to_anchor=(0.01, 0.965), ncol=2, labelcolor=ink)
-    n_h = int(long[(long["metric"] == "fnr") & (long["condition"] == "original")]["n"].max())
-    n_u = int(long[(long["metric"] == "fpr") & (long["condition"] == "original")]["n"].max())
+    n_h, n_u = _n_orig(long, "fnr"), _n_orig(long, "fpr")
     fig.suptitle(f"{model} under Japanese orthographic variation  (harmful n={n_h}, benign n={n_u}; "
                  f"error bars = 95% Wilson CI){title_suffix}", color=ink, fontsize=11, x=0.01, ha="left")
     fig.tight_layout(rect=(0, 0, 1, 0.93))
+    fig.savefig(out, dpi=160, facecolor=surface)
+    plt.close(fig)
+
+
+def _n_orig(long: pd.DataFrame, metric: str) -> int:
+    n = long[(long["metric"] == metric) & (long["condition"] == "original")]["n"].max()
+    return 0 if pd.isna(n) else int(n)
+
+
+SWEEP_TITLES = {"fnr": "Harmful prompts: miss rate (FNR, %)", "fpr": "Benign prompts: false-positive rate (FPR, %)"}
+
+
+def plot_sweep(long: pd.DataFrame, out: Path, metric: str, model: str, title_suffix: str = "") -> None:
+    """v5：手法ごとの小さなグラフ（横軸＝変換する内容語の割合、0% は original）。
+    組み合わせの手法には、構成する単独の手法（strict）を灰色の破線・点線で重ねる。"""
+    colors = {"strict": "#2a78d6", "loose": "#eb6834"}  # analyze.plot と同じ検証済みの2色
+    ink, muted, grid, surface = "#1f1f1e", "#6b6a64", "#e4e3de", "#fcfcfb"
+    d = long[long["metric"] == metric]
+    present = set(d["condition"])
+    methods = [m for m in V5_METHODS if any(f"{m}@{r}" in present for r in V5_RATES)]
+    # Controversial がないモデルは strict と loose が同じなので strict だけ描く
+    modes = ["strict"]
+    piv = d.pivot_table(index="condition", columns="mode", values="rate")
+    if "loose" in piv and not np.allclose(piv["strict"].fillna(-1), piv["loose"].fillna(-1)):
+        modes.append("loose")
+
+    def series(m: str, mode: str) -> tuple[list[int], list[float]]:
+        xs, ys = [0], [d[(d["condition"] == "original") & (d["mode"] == mode)]["rate"].mean() * 100]
+        for r in V5_RATES:
+            row = d[(d["condition"] == f"{m}@{r}") & (d["mode"] == mode)]
+            if len(row):
+                xs.append(r)
+                ys.append(row["rate"].iloc[0] * 100)
+        return xs, ys
+
+    ncol = 5
+    nrow = int(np.ceil(len(methods) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(3.2 * ncol, 2.9 * nrow + 0.9), facecolor=surface,
+                             sharex=True, sharey=True, squeeze=False)
+    for ax, m in zip(axes.flat, methods):
+        ax.set_facecolor(surface)
+        if "+" in m:
+            for part, ls in zip(m.split("+"), ("--", ":")):
+                if part in methods:
+                    xs, ys = series(part, "strict")
+                    ax.plot(xs, ys, color=muted, lw=1.5, ls=ls, zorder=2, label=f"component: {part}")
+        # loose を太く下に、strict を細く上に描く（同じ値でも両方が見える）
+        for mode in reversed(modes):
+            xs, ys = series(m, mode)
+            wide = mode == "loose"
+            ax.plot(xs, ys, color=colors[mode], lw=4 if wide else 1.8, marker="o", ms=7 if wide else 4,
+                    zorder=3 if wide else 4)
+        ax.set_title(m, color=ink, fontsize=10, loc="left")
+        if "+" in m:
+            parts = m.split("+")
+            ax.text(0.02, 0.97, f"gray -- {parts[0]}\ngray ·· {parts[1]}", transform=ax.transAxes,
+                    va="top", fontsize=7, color=muted)
+        ax.set_ylim(0, 100)
+        ax.set_xticks([0, *V5_RATES])
+        ax.grid(color=grid, linewidth=0.8, zorder=0)
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+        for sp in ("left", "bottom"):
+            ax.spines[sp].set_color(grid)
+        ax.tick_params(colors=muted, labelsize=8)
+    for ax in axes.flat[len(methods):]:
+        ax.set_visible(False)
+    for ax in axes[-1]:
+        ax.set_xlabel("content words changed (%)", color=muted, fontsize=8)
+    handles = [plt.Line2D([], [], color=colors[mo], lw=4 if mo == "loose" else 1.8, marker="o",
+                          ms=7 if mo == "loose" else 4) for mo in modes]
+    labels = [f"{mo} (Controversial = {'unsafe' if mo == 'strict' else 'safe'})" for mo in modes]
+    handles.append(plt.Line2D([], [], color=muted, lw=1.5, ls="--"))
+    labels.append("component method alone (strict)")
+    fig.legend(handles, labels, frameon=False, loc="upper left", bbox_to_anchor=(0.01, 0.955), ncol=3, labelcolor=ink, fontsize=9)
+    n = _n_orig(long, metric)
+    fig.suptitle(f"{model}: {SWEEP_TITLES[metric]} vs. share of content words changed  (n={n}; 0% = original){title_suffix}",
+                 color=ink, fontsize=11, x=0.01, ha="left")
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
     fig.savefig(out, dpi=160, facecolor=surface)
     plt.close(fig)
 
@@ -174,7 +257,7 @@ def per_class(pred: pd.DataFrame) -> pd.DataFrame:
     - macro_f1      = 2クラスの F1 の平均。パース失敗の行は除外。
     """
     rows = []
-    conds = [c for c in CONDITIONS if c in set(pred["condition"])]
+    conds = [c for c in ALL_CONDITIONS if c in set(pred["condition"])]
     for mode in MODES:
         col = f"pred_{mode}"
         for cond in conds:
@@ -200,9 +283,13 @@ def per_class(pred: pd.DataFrame) -> pd.DataFrame:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--predictions", type=Path, default=DEFAULT_PRED)
+    ap.add_argument("--data-version", default=DATA_VERSION, choices=DATA_VERSIONS,
+                    help="--predictions を省略したときに読むファイルのバージョン")
+    ap.add_argument("--predictions", type=Path, default=None,
+                    help="省略時は outputs/predictions_qwen3guard-0.6b_<data-version>.csv")
     ap.add_argument("--outdir", type=Path, default=OUT_DIR)
     args = ap.parse_args()
+    args.predictions = args.predictions or OUT_DIR / f"{PRED_PREFIX}_qwen3guard-0.6b_{args.data_version}.csv"
 
     pred = pd.read_csv(args.predictions)
     # 出力ファイル名の接尾辞（例：predictions_qwen3guard-0.6b_v4_limit10.csv → _qwen3guard-0.6b_v4_limit10）
@@ -218,7 +305,16 @@ def main() -> None:
     long.to_csv(args.outdir / f"summary_long{suffix}.csv", index=False)
     pc = per_class(pred)
     pc.to_csv(args.outdir / f"per_class{suffix}.csv", index=False)
-    plot(long, args.outdir / f"fnr_fpr{suffix}.png", f"  [{suffix.strip('_')}]" if suffix else "", model)
+    tag = f"  [{suffix.strip('_')}]" if suffix and suffix.strip("_") != model else ""
+    if pred["condition"].str.contains("@").any():  # v5：割合スイープの折れ線グラフ
+        figs = []
+        for metric in METRICS:
+            if _n_orig(long, metric):
+                plot_sweep(long, args.outdir / f"sweep_{metric}{suffix}.png", metric, model, tag)
+                figs.append(f"sweep_{metric}{suffix}.png")
+    else:
+        plot(long, args.outdir / f"fnr_fpr{suffix}.png", tag, model)
+        figs = [f"fnr_fpr{suffix}.png"]
 
     pd.set_option("display.width", 200)
     show = ["condition", "n_harmful", "n_unharmful", "parse_errors", "n_text_unchanged"]
@@ -234,7 +330,7 @@ def main() -> None:
     print("\n[per-class] クラス別 正答率・F1")
     print(pc[["mode", "condition", "harmful_acc", "harmful_f1", "unharmful_acc", "unharmful_f1", "accuracy", "macro_f1"]]
           .round(3).to_string(index=False))
-    print(f"\n[save] {args.outdir / f'summary{suffix}.csv'} / summary_long{suffix}.csv / per_class{suffix}.csv / fnr_fpr{suffix}.png")
+    print(f"\n[save] {args.outdir / f'summary{suffix}.csv'} / summary_long{suffix}.csv / per_class{suffix}.csv / {' / '.join(figs)}")
 
 
 if __name__ == "__main__":

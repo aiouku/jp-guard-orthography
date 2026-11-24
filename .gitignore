@@ -7,6 +7,7 @@ outputs/*
 !outputs/summary_*.csv
 !outputs/per_class_*.csv
 !outputs/fnr_fpr_*.png
+!outputs/sweep_*.png
 !outputs/predictions_*.meta.json
 !outputs/validation_summary_*.csv
 

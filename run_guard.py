@@ -1,13 +1,16 @@
-"""3. 変換済みデータセット（data/perturbed_<DATA_VERSION>.jsonl）をガードモデルで判定する。
+"""3. 変換済みデータセット（data/perturbed_<データのバージョン>.jsonl）をガードモデルで判定する。
 
 - 判定中に変換は一切しない（text_perturbed をそのまま使う）
 - 結果はバッチごとに CSV に追記し、再実行すると未処理の (id, condition) だけを処理する（再開可能）
-- 出力ファイル名はモデルごと：outputs/predictions_<モデル名>_<DATA_VERSION>.csv
+- 出力ファイル名はモデルごと：outputs/predictions_<モデル名>_<データのバージョン>.csv
+- --labels harmful で有害だけを判定できる。あとで --labels を外して同じコマンドを実行すると、無害の分だけ追加される
 - モデルごとの入力の作り方・出力の読み取り方は guards.py
 
 使い方:
   python run_guard.py --limit 10                                   # 試運転（各条件 10 件 = 有害5・無害5）
-  python run_guard.py                                              # Qwen3Guard-Gen-0.6B で全件
+  python run_guard.py                                              # Qwen3Guard-Gen-0.6B で全件（データ v5）
+  python run_guard.py --labels harmful                             # 有害だけ（v5 の割合スイープ向け）
+  python run_guard.py --data-version v4                            # v4 の14条件
   python run_guard.py --model Qwen/Qwen3Guard-Gen-8B --batch-size 16
   python run_guard.py --model nvidia/Llama-3.1-Nemotron-Safety-Guard-8B-v3
   python run_guard.py --model mistralai/Shieldstral-1.0-3B         # 要 pip install mistral-common
@@ -29,9 +32,9 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
-from common import DATA_VERSION, OUT_DIR, PERTURBED_JSONL, SEED, load_perturbed, set_seed
+from common import DATA_VERSION, DATA_VERSIONS, OUT_DIR, SEED, load_perturbed, perturbed_paths, set_seed
 from guards import ADD_GENERATION_PROMPT, KINDS, PARSERS, messages_for, model_slug, parse_shieldstral, spec_for
-from perturb.conditions import CONDITIONS
+from perturb.conditions import conditions_for
 
 MODEL_NAME = "Qwen/Qwen3Guard-Gen-0.6B"
 DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
@@ -41,8 +44,11 @@ COLUMNS = [
 ]
 
 
-def default_out(model: str) -> Path:
-    return OUT_DIR / f"predictions_{model_slug(model)}_{DATA_VERSION}.csv"
+LABELS = {"all": (0, 1), "harmful": (1,), "unharmful": (0,)}
+
+
+def default_out(model: str, version: str = DATA_VERSION) -> Path:
+    return OUT_DIR / f"predictions_{model_slug(model)}_{version}.csv"
 
 
 def pick_device() -> torch.device:
@@ -171,18 +177,26 @@ class ShieldstralGuard:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--input", type=Path, default=PERTURBED_JSONL)
+    ap.add_argument("--data-version", default=DATA_VERSION, choices=DATA_VERSIONS)
+    ap.add_argument("--input", type=Path, default=None, help="省略時は data/perturbed_<data-version>.jsonl")
     ap.add_argument("--model", default=MODEL_NAME)
     ap.add_argument("--kind", default=None, choices=KINDS, help="モデルの種類（通常はモデル名から自動判定）")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--limit", type=int, default=None, help="各条件で判定する件数（有害・無害を半数ずつ）")
-    ap.add_argument("--conditions", nargs="*", default=CONDITIONS, choices=CONDITIONS)
+    ap.add_argument("--conditions", nargs="*", default=None, help="判定する条件（省略時はそのバージョンの全条件）")
+    ap.add_argument("--labels", default="all", choices=list(LABELS), help="判定するラベル（harmful＝有害だけ）")
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--max-new-tokens", type=int, default=None, help="省略時はモデルごとの既定値（guards.py）")
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "mps", "cpu"])
     ap.add_argument("--dtype", default=None, choices=list(DTYPES),
                     help="省略時はモデルごとの既定値（Qwen3Guard-Gen-0.6B は v3 と同じ float32、その他は bfloat16）")
     args = ap.parse_args()
+    all_conds = conditions_for(args.data_version)
+    if args.conditions is None:
+        args.conditions = all_conds
+    elif unknown := [c for c in args.conditions if c not in all_conds]:
+        sys.exit(f"[error] データ {args.data_version} にない条件です: {unknown}")
+    args.input = args.input or perturbed_paths(args.data_version)[1]
 
     spec = spec_for(args.model, args.kind)
     dtype_name = args.dtype or spec.dtype
@@ -190,7 +204,7 @@ def main() -> None:
 
     set_seed(SEED)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    base_out = default_out(args.model)
+    base_out = default_out(args.model, args.data_version)
     out_path = args.out or (
         base_out if args.limit is None else base_out.with_name(f"{base_out.stem}_limit{args.limit}.csv")
     )
@@ -199,8 +213,10 @@ def main() -> None:
     if args.limit is not None:
         ids = select_limit_ids(df, args.limit)
         df = df[df["id"].isin(ids)]
+    df = df[df["label"].isin(LABELS[args.labels])]
     done = load_done(out_path, df)
-    print(f"[data] {args.input}: {df['id'].nunique()} 件 × {df['condition'].nunique()} 条件 / 処理済み {len(done)} 行 → {out_path}")
+    print(f"[data] {args.input}（{args.labels}）: {df['id'].nunique()} 件 × {df['condition'].nunique()} 条件 / "
+          f"処理済み {len(done)} 行 → {out_path}")
 
     n_todo = sum((int(i), c) not in done for i, c in zip(df["id"], df["condition"]) if c in args.conditions)
     if n_todo == 0:
@@ -218,7 +234,8 @@ def main() -> None:
         "model": args.model, "kind": spec.kind, "device": str(device), "dtype": dtype_name,
         "batch_size": args.batch_size, "max_new_tokens": max_new_tokens,
         "decoding": "single forward (p(yes) > 0.5)" if spec.kind == "shieldstral" else "greedy",
-        "seed": SEED, "input": str(args.input), "limit": args.limit, "torch": torch.__version__,
+        "seed": SEED, "data_version": args.data_version, "input": str(args.input), "limit": args.limit,
+        "labels": args.labels, "torch": torch.__version__,
         "python": platform.python_version(), "transformers": __import__("transformers").__version__,
         "started": time.strftime("%Y-%m-%d %H:%M:%S"),
         "gpu": torch.cuda.get_device_name(0) if device.type == "cuda" else None,
