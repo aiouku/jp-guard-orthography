@@ -1,0 +1,17 @@
+{
+  "model": "meta-llama/Llama-Guard-3-8B",
+  "kind": "llamaguard3",
+  "device": "cuda",
+  "dtype": "bfloat16",
+  "batch_size": 8,
+  "max_new_tokens": 16,
+  "decoding": "greedy",
+  "seed": 42,
+  "input": "/data/kei/papers/data/perturbed_v4.jsonl",
+  "limit": null,
+  "torch": "2.5.1",
+  "python": "3.12.16",
+  "transformers": "4.57.6",
+  "started": "2026-11-18 01:08:33",
+  "gpu": "NVIDIA A10"
+}
